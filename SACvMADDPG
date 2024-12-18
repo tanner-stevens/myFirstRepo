@@ -1,0 +1,225 @@
+import os
+import ray
+import numpy as np
+from ray import tune
+from ray.rllib.agents.sac import SACTrainer
+# If MADDPG is available from contrib:
+
+from ray.rllib.contrib.maddpg.maddpg import MADDPGTrainer
+
+import gym
+import gym_wind_turbine  # Ensure this is properly installed
+
+from gym.spaces import Box
+from ray.rllib.env.multi_agent_env import MultiAgentEnv
+
+
+###################################################
+# Multi-Turbine Multi-Agent Environment Wrapper
+###################################################
+
+class MultiTurbineEnv(MultiAgentEnv):
+    def __init__(self, config):
+        """
+        A multi-agent environment that manages 40 independent wind turbine
+        simulations from the 'gym-wind-turbine' environment.
+
+        config:
+          - num_turbines: number of turbine agents (default 40)
+          - env_config (optional): configs to pass to each single-turbine env
+        """
+        self.num_turbines = config.get("num_turbines", 40)
+        self.single_envs = []
+
+        # Any additional config for the single-turbine environment
+        single_env_config = config.get("single_env_config", {})
+
+        # Create multiple instances of the single-turbine environment
+        for _ in range(self.num_turbines):
+            env = gym.make("wind-turbine-v0", **single_env_config)
+            self.single_envs.append(env)
+
+        # Identify each agent by a string id
+        self.agent_ids = [f"turbine_{i}" for i in range(self.num_turbines)]
+
+        # Optional: Store action/observation spaces for reference
+        # Assuming all turbines have the same spaces
+        self.observation_space = self.single_envs[0].observation_space
+        self.action_space = self.single_envs[0].action_space
+
+    def reset(self):
+        """
+        Reset all turbine sub-environments and return a dict of observations keyed by agent_id.
+        """
+        obs_dict = {}
+        for i, env in enumerate(self.single_envs):
+            obs = env.reset()
+            obs_dict[self.agent_ids[i]] = obs
+        return obs_dict
+
+    def step(self, action_dict):
+        """
+        Step all turbines given an action dict mapping agent_id to actions.
+
+        Returns:
+        - obs_dict: {agent_id: observation}
+        - reward_dict: {agent_id: reward}
+        - done_dict: {agent_id: done, "__all__": bool}
+        - info_dict: {agent_id: info}
+        """
+        obs_dict = {}
+        reward_dict = {}
+        done_dict = {}
+        info_dict = {}
+
+        # Step each turbine with its action
+        for i, env in enumerate(self.single_envs):
+            agent_id = self.agent_ids[i]
+            action = action_dict[agent_id]
+            obs, rew, done, info = env.step(action)
+            obs_dict[agent_id] = obs
+            reward_dict[agent_id] = rew
+            done_dict[agent_id] = done
+            info_dict[agent_id] = info
+
+        # The episode ends when all turbines are done or if you define another condition.
+        # If turbines can end at different times, you must define how that affects "__all__".
+        # For simplicity, consider the episode done if ANY turbine is done:
+        # In many scenarios, you'd wait until all turbines are done, but this depends on your logic.
+
+        # done_all = all(done_dict.values()) # if you want all done
+        done_all = any(done_dict.values())  # ends episode if any turbine is done
+        done_dict["__all__"] = done_all
+
+        return obs_dict, reward_dict, done_dict, info_dict
+
+
+###################################################
+# Ray Initialization
+###################################################
+ray.shutdown()
+ray.init(ignore_reinit_error=True, log_to_driver=True)
+
+NUM_TURBINES = 40
+
+############################################
+# Environment Config
+############################################
+env_config = {
+    "num_turbines": NUM_TURBINES,
+    # If the single turbine environment supports extra parameters,
+    # you can include them here:
+    "single_env_config": {
+        # For example: wind_speed=..., turbulence_intensity=...
+        # Check gym-wind-turbine documentation for possible configs
+    }
+}
+
+
+############################################
+# Policy Mapping Functions
+############################################
+def shared_policy_mapping(agent_id):
+    # For SAC shared policy scenario, map all agents to one policy
+    return "shared_policy"
+
+
+def per_agent_policy_mapping(agent_id):
+    # For MADDPG, each agent might have its own policy
+    return agent_id
+
+
+############################################
+# SAC Configuration (Shared Policy)
+############################################
+sac_config = {
+    "env": MultiTurbineEnv,
+    "env_config": env_config,
+    "multiagent": {
+        "policies": {
+            "shared_policy": (None,
+                              MultiTurbineEnv(env_config).observation_space,
+                              MultiTurbineEnv(env_config).action_space,
+                              {})
+        },
+        "policy_mapping_fn": shared_policy_mapping,
+        "policies_to_train": ["shared_policy"],
+    },
+    "framework": "torch",
+    "num_workers": 2,  # Increase if you have more CPU cores
+    "num_gpus": 0,  # Set to 1 if you have a GPU and want acceleration
+    # Additional SAC hyperparams:
+    "learning_starts": 1000,
+    "tau": 0.005,
+    "train_batch_size": 256,
+    "target_entropy": "auto",
+}
+
+sac_stop = {
+    "timesteps_total": 200_000,  # Adjust training budget as needed
+}
+
+print("Starting SAC Training on MultiTurbineEnv...")
+tune.run(
+    SACTrainer,
+    stop=sac_stop,
+    config=sac_config,
+    local_dir=os.path.join("results", "windfarm_sac"),
+    checkpoint_at_end=True
+)
+
+############################################
+# MADDPG Configuration (One Policy Per Agent)
+############################################
+# NOTE: If MADDPG is not available by default, you must ensure it is accessible.
+# MADDPG from RLlib contrib might need manual enabling:
+# `from ray.rllib.contrib.maddpg.maddpg import MADDPGTrainer`
+# If not available, you'll need a custom policy/class or try another MARL framework.
+
+policies = {}
+for agent_id in MultiTurbineEnv(env_config).agent_ids:
+    policies[agent_id] = (None,
+                          MultiTurbineEnv(env_config).observation_space,
+                          MultiTurbineEnv(env_config).action_space,
+                          {})
+
+maddpg_config = {
+    "env": MultiTurbineEnv,
+    "env_config": env_config,
+    "multiagent": {
+        "policies": policies,
+        "policy_mapping_fn": per_agent_policy_mapping,
+        "policies_to_train": list(policies.keys()),
+    },
+    "framework": "torch",
+    "num_workers": 2,
+    "num_gpus": 0,  # set to 1 if GPU is available
+    # Additional MADDPG parameters:
+    "actor_lr": 1e-3,
+    "critic_lr": 1e-3,
+    "buffer_size": 1000000,
+}
+
+try:
+    from ray.rllib.contrib.maddpg.maddpg import MADDPGTrainer
+
+    maddpg_stop = {
+        "timesteps_total": 200_000,  # Adjust as needed
+    }
+    print("Starting MADDPG Training on MultiTurbineEnv...")
+    tune.run(
+        MADDPGTrainer,
+        stop=maddpg_stop,
+        config=maddpg_config,
+        local_dir=os.path.join("results", "windfarm_maddpg"),
+        checkpoint_at_end=True
+    )
+except ImportError:
+    print("MADDPGTrainer not found. Ensure that RLlib's MADDPG is installed or implement it manually.")
+
+############################################
+# After running both experiments:
+# Check "results/windfarm_sac" and "results/windfarm_maddpg" directories
+# for training logs, progress, and checkpoints.
+# load these checkpoints and run evaluation episodes to compare performance.
+############################################
